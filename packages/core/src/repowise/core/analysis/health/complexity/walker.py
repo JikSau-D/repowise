@@ -19,14 +19,18 @@ function. Module-level lambdas, such as route callbacks, produce their
 own ``FunctionComplexity`` row.
 
 This module is the orchestrator: ``walk_file`` parses the source once and
-drives the individual passes, each of which lives in its own sibling module:
+drives the individual passes, each of which lives in its own sibling module.
+The whole-file passes share one descent of the tree (``file_scan``):
 
 - ``models``:         the output dataclasses
+- ``file_scan``:      the shared descent: NLOC index, error handling, classes
 - ``ast_utils``:      name/text helpers, function-node collection, params
 - ``nloc``:           non-blank / non-comment line counting
 - ``cyclomatic``:     the CCN / cognitive / nesting engine
 - ``assertions``:     assertion blocks + per-function assertion totals
 - ``test_case``:      whether a walked function is a test case
+- ``dispatch``:       how much of the CCN is one dispatch on one value
+- ``deprecation``:    whether a function is marked deprecated
 - ``mock_walk``:      per-function mock-setup counting (test-quality)
 - ``error_handling``: error-handling anti-patterns
 - ``perf_walk``:      the performance-risk pass
@@ -34,8 +38,6 @@ drives the individual passes, each of which lives in its own sibling module:
 """
 
 from __future__ import annotations
-
-from typing import TYPE_CHECKING
 
 import structlog
 
@@ -46,16 +48,15 @@ from .ast_utils import (
     _collect_function_nodes,
     _count_parameters,
     _find_function_entry_name,
+    _parameter_list,
 )
 from .class_analysis import _collect_classes
 from .cyclomatic import _walk_function_body
-from .error_handling import _collect_error_handling, _eh_rust_attr_is_test
+from .deprecation import is_deprecated
+from .dispatch import dispatch_points, dispatch_share
+from .file_scan import scan_file
 from .languages import get_language_map
 from .mock_walk import _count_mock_setup, file_may_contain_mocks
-from .test_case import is_test_case
-
-if TYPE_CHECKING:
-    from tree_sitter import Node
 
 # Re-exported so the package façade (``__init__``) and downstream consumers
 # keep importing the output schema from ``complexity.walker`` unchanged.
@@ -72,8 +73,10 @@ from .models import (
 
 # ``_count_file_nloc`` is re-exported for ``tests/unit/health/test_file_nloc.py``,
 # which imports it directly from this module.
-from .nloc import _count_file_nloc, _count_file_nloc_tree, _count_nloc
-from .perf_walk import _collect_perf_hits
+from .nloc import _count_file_nloc
+from .perf_walk import _collect_perf_hits, perf_pass_runs
+from .signature import is_constructor, is_signature_fixed, typed_param_counts
+from .test_case import is_test_case
 
 __all__ = [
     "ClassComplexity",
@@ -122,12 +125,15 @@ def walk_file(
         # Reuse the ingestion parser's language registry. Importing
         # lazily avoids pulling tree-sitter at module load time when
         # health is run from a context where it isn't installed.
-        from repowise.core.ingestion.parser import _get_language
+        from repowise.core.ingestion.parser import _get_language, grammar_tag_for
     except Exception as exc:
         log.debug("complexity_walker_import_failed", error=str(exc))
         return FileComplexity(functions=[], classes=[], file_nloc=_count_file_nloc(source))
 
-    grammar = _get_language(language)
+    # The grammar follows the path, the language tag does not: everything
+    # below still selects its dialects by ``language``. ``engine.py`` keys the
+    # walk cache on this same tag, so the two must not drift.
+    grammar = _get_language(grammar_tag_for(language, abs_path))
     if grammar is None:
         return FileComplexity(functions=[], classes=[], file_nloc=_count_file_nloc(source))
 
@@ -147,21 +153,31 @@ def walk_file(
     functions: list[FunctionComplexity] = []
     fc_by_node_id: dict[int, FunctionComplexity] = {}
     # Dialect first: it is a dict hit that rules out most languages before the
-    # byte scan. Keyed on language and bytes only, never the path, which is what
-    # the walk cache keys on.
+    # byte scan. Keyed on the language and the bytes, never the path: above,
+    # the path settles the grammar and nothing else.
     dialect = _mock_dialect(language)
     mock_dialect = dialect if dialect is not None and file_may_contain_mocks(source) else None
     # Broad-tier assertion vocabulary. ``None`` for a language with no row,
     # which leaves the narrow tier alone and is what every language counted
     # before this existed.
     asserts = _assert_dialect(language, extra_assert_names)
+    run_perf = perf_pass_runs(language, lmap)
+    scan = scan_file(tree.root_node, language, lmap, source, io_names=run_perf)
     for fn_node in _collect_function_nodes(tree.root_node, lmap):
         body = fn_node.child_by_field_name("body") or fn_node
-        ccn, max_nest, cognitive, bumps, conditions = _walk_function_body(body, lmap)
-        assertion_blocks, assertion_count, verifications = _collect_assertion_facts(
-            body, lmap, asserts
-        )
+        deepest: list[int] = []
+        ccn, max_nest, cognitive, bumps, conditions = _walk_function_body(body, lmap, deepest)
+        (
+            assertion_blocks,
+            assertion_count,
+            verifications,
+            raises,
+            called,
+            bare_called,
+        ) = _collect_assertion_facts(body, lmap, asserts)
         name = _find_function_entry_name(fn_node, lmap)
+        typed, scalar = typed_param_counts(_parameter_list(fn_node), lmap)
+        dispatch = dispatch_points(body, lmap)
         fc = FunctionComplexity(
             name=name,
             start_line=fn_node.start_point[0] + 1,
@@ -169,31 +185,46 @@ def walk_file(
             ccn=ccn,
             max_nesting=max_nest,
             cognitive=cognitive,
-            nloc=_count_nloc(body, source),
+            nloc=scan.lines.count(body, source),
             bumps=bumps,
             param_count=_count_parameters(fn_node),
+            typed_param_count=typed,
+            primitive_param_count=scalar,
+            is_constructor=is_constructor(fn_node, name, lmap),
+            signature_fixed=is_signature_fixed(fn_node, lmap),
             complex_conditions=conditions,
             assertion_blocks=assertion_blocks,
             assertion_count=assertion_count,
             verification_count=verifications,
+            raise_count=raises,
             mock_setup_count=_count_mock_setup(fn_node, body, lmap, mock_dialect, asserts),
             is_test_case=is_test_case(fn_node, name, language),
+            called_names=called,
+            bare_called_names=bare_called,
+            dispatch_share=dispatch_share(dispatch.points, ccn),
+            dispatch_arm=dispatch.arm,
+            deprecated=is_deprecated(fn_node, body, name, lmap, source),
+            deepest_block=(deepest[0], deepest[1]) if deepest else None,
         )
         functions.append(fc)
         fc_by_node_id[fn_node.id] = fc
 
-    classes = _collect_classes(tree.root_node, lmap, source, fc_by_node_id)
-    perf_hits, io_boundary_names, perf_fn_facts = _collect_perf_hits(tree.root_node, language, lmap)
+    classes = _collect_classes(
+        scan.class_nodes, lmap, source, fc_by_node_id, scan.lines, language
+    )
+    perf_hits, io_boundary_names, perf_fn_facts = _collect_perf_hits(
+        tree.root_node, language, lmap, scan.io_names
+    )
     return FileComplexity(
         functions=functions,
         classes=classes,
-        file_nloc=_count_file_nloc_tree(tree.root_node, source),
-        error_handling_hits=_collect_error_handling(tree.root_node, language, lmap),
+        file_nloc=scan.lines.file_nloc,
+        error_handling_hits=scan.error_handling_hits,
         perf_hits=perf_hits,
         io_boundary_names=io_boundary_names,
         perf_fn_facts=perf_fn_facts,
         has_inline_tests=_detect_inline_tests(source, language),
-        rust_test_line_ranges=_rust_test_line_ranges(tree.root_node, language),
+        rust_test_line_ranges=scan.rust_test_line_ranges,
     )
 
 
@@ -226,56 +257,3 @@ def _detect_inline_tests(source: bytes, language: str) -> bool:
     if language != "rust":
         return False
     return any(marker in source for marker in _RUST_INLINE_TEST_MARKERS)
-
-
-# ``function_item`` / ``mod_item`` / ``impl_item`` are the Rust item kinds a
-# ``#[cfg(test)]`` (or ``#[test]`` / ``#[tokio::test]`` / ``#[rstest]``, for a
-# bare fn) attribute can gate. ``mod``/``impl`` are containers: their whole
-# span is test-only once gated, including any nested fn that carries no
-# attribute of its own — the same reason ``#[cfg(test)] mod tests { .. }``
-# hides ordinary-looking helper fns from the file-level heuristic above.
-_RUST_TEST_ITEM_KINDS = ("function_item", "mod_item", "impl_item")
-
-
-def _rust_test_line_ranges(root: Node, language: str) -> tuple[tuple[int, int], ...]:
-    """1-indexed ``(start_line, end_line)`` spans of Rust test-only code.
-
-    Walks the SAME tree ``walk_file`` already parsed (no extra parse). Marks a
-    ``mod_item`` / ``impl_item`` / ``function_item`` whose immediately
-    preceding attribute siblings include a test marker
-    (:func:`repowise.core.analysis.health.complexity.error_handling._eh_rust_attr_is_test`,
-    shared with the error-handling walker so both passes recognize the
-    identical attribute grammar), and does not descend into a marked node —
-    its span already covers everything nested inside. Rust-only; every other
-    language gets ``()``, so :func:`repowise.core.analysis.health.perf.gated._in_rust_test_range`
-    is a no-op for it.
-    """
-    if language != "rust":
-        return ()
-
-    ranges: list[tuple[int, int]] = []
-
-    def _text(node: Node) -> str:
-        return (node.text or b"").decode("utf-8", errors="replace")
-
-    def _is_marked(node: Node) -> bool:
-        sib = node.prev_sibling
-        while sib is not None and sib.type in (
-            "attribute_item",
-            "line_comment",
-            "block_comment",
-        ):
-            if sib.type == "attribute_item" and _eh_rust_attr_is_test(_text(sib)):
-                return True
-            sib = sib.prev_sibling
-        return False
-
-    def _walk(node: Node) -> None:
-        if node.type in _RUST_TEST_ITEM_KINDS and _is_marked(node):
-            ranges.append((node.start_point[0] + 1, node.end_point[0] + 1))
-            return  # span already covers every nested item; don't descend
-        for child in node.children:
-            _walk(child)
-
-    _walk(root)
-    return tuple(ranges)

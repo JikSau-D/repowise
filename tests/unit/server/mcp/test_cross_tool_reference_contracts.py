@@ -132,8 +132,15 @@ _SYMBOL_FIELDS = {
     "symbol_id",
     "target_node_id",
 }
+# Every lane that carries decision ids, not just the accepted one. A candidate
+# and a withdrawn decision are followable to ``get_why`` exactly as a governing
+# one is, so a consumer that can follow one can follow all three; listing only
+# ``decisions`` would have made the inventory blind to two thirds of what
+# ``get_context`` and ``get_why`` both emit.
 _DECISION_COLLECTIONS = {
     "decisions",
+    "candidates",
+    "history",
     "lineage",
     "recent_reversals",
     "top_active",
@@ -601,7 +608,9 @@ async def test_canonical_emitter_reference_inventory(
                     resolved = await get_context([ref.value])
                     card = resolved["targets"][ref.value]
                     assert card.get("error") is None, (ref, card)
-                    assert card.get("target") == ref.value
+                    # The ref resolves because the card is keyed on it; the
+                    # card no longer echoes the key back as a ``target`` field.
+                    assert "target" not in card
                     if ref.kind == "symbol":
                         _assert_symbol_card(
                             resolved,
@@ -717,7 +726,8 @@ async def _seed_plan(session, repository_id: str) -> None:
 
 def _assert_symbol_card(result: dict, symbol_id: str, path: str, name: str) -> None:
     card = result["targets"][symbol_id]
-    assert card["target"] == symbol_id
+    # The map key is the target; the card no longer echoes it back as a field.
+    assert "target" not in card
     assert card["type"] == "symbol"
     assert card["docs"]["file_path"] == path
     assert card["docs"]["name"] == name
@@ -802,7 +812,7 @@ async def test_emitted_file_paths_resolve_to_content(reference_repo, path: str) 
     card = result["targets"][path]
     expected_type = "file" if "." in path.rsplit("/", 1)[-1] else "module"
     assert card.get("error") is None
-    assert card["target"] == path
+    assert "target" not in card
     assert card["type"] == expected_type, (path, card)
     assert "resolved_to" not in card
     assert card.get("docs") or card.get("summary") or card.get("files")
@@ -844,8 +854,8 @@ async def test_finding_and_plan_ids_are_stable_and_resolve_in_one_call(
     health_data,
     session,
 ) -> None:
+    from repowise.core.analysis.dead_code.serving import dead_code_finding_id
     from repowise.server.mcp_server import get_dead_code, get_health
-    from repowise.server.mcp_server.tool_dead_code import _dead_code_finding_id
     from repowise.server.mcp_server.tool_health import (
         _health_finding_id,
         _refactoring_plan_id,
@@ -886,7 +896,7 @@ async def test_finding_and_plan_ids_are_stable_and_resolve_in_one_call(
     plan_row = (await session.execute(select(RefactoringSuggestion))).scalars().first()
     for row, public_id, factory in (
         (health_row, health_finding["id"], _health_finding_id),
-        (dead_row, dead_finding["id"], _dead_code_finding_id),
+        (dead_row, dead_finding["id"], dead_code_finding_id),
         (plan_row, plan["id"], _refactoring_plan_id),
     ):
         replacement = copy(row)

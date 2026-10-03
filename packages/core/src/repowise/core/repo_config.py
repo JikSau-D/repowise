@@ -37,7 +37,10 @@ CONFIG_DEPENDENCY_KEYS: dict[str, frozenset[str]] = {
             "enable_onboarding",
         }
     ),
-    "state_only": frozenset({"distill", "mcp"}),
+    # Agent-surface preferences. init records `hooks` and `editor_files` after
+    # it fingerprints the config, so leaving them in "other" turned the first
+    # update after every init into a full rebuild.
+    "state_only": frozenset({"distill", "editor_files", "hooks", "mcp"}),
 }
 
 
@@ -151,6 +154,19 @@ def config_fingerprint(repo_path: Path | str) -> str:
             h.update(name.encode())
             h.update(p.read_bytes())
     return h.hexdigest()
+
+
+def health_rules_fingerprint(repo_path: Path | str) -> str:
+    """:func:`config_fingerprint`, degraded to an empty string when unreadable.
+
+    What a change-health comparison pins its findings to. An empty string is a
+    real answer there: it means "rules unknown", which never matches a stored
+    fingerprint, so the rows are recomputed rather than trusted.
+    """
+    try:
+        return config_fingerprint(repo_path)
+    except Exception:
+        return ""
 
 
 def config_dependency_fingerprints(

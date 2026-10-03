@@ -6,6 +6,7 @@ from typing import Any
 
 from sqlalchemy import select
 
+from repowise.core.analysis.next_call import ActionCommand
 from repowise.core.analysis.risk_semantics import structural_impact_contract
 from repowise.core.persistence.crud.authority import decision_currencies
 from repowise.core.persistence.database import get_session
@@ -57,6 +58,7 @@ _MAY_BREAK_TESTS_LIMIT = 3
 #: than the may-break lists (it is what you actually run), but stays glanceable;
 #: the overflow and full typed rows live in pr_blast_radius.test_impact.
 _TESTS_TO_RUN_LIMIT = 10
+_TESTS_TO_RUN_KIND = {"measured": "test_id", "inferred": "test_file"}
 
 
 def _breaking_change_directive(
@@ -448,6 +450,35 @@ def _governance_reason(dr: Any, currency: str, conflict_decision_ids: set[str]) 
     return None
 
 
+def _project_recommendation(row: dict[str, Any]) -> dict[str, Any]:
+    """Drop what a reader can rebuild from the row it ships beside.
+
+    ``analyze_test_impact`` builds ``source_files`` and ``bases`` by folding
+    ``evidence`` (``core/analysis/test_impact.py:256-270``), so on the wire they
+    are the same fact twice. ``test_file`` differs from ``test_id`` only for a
+    measured row whose id carries a ``::`` selector, and ``source_format`` is
+    None on every inferred row. The typed row core hands its own callers is
+    untouched; this is the projection get_risk emits.
+    """
+    out = {k: v for k, v in row.items() if k not in {"repository", "repository_id"}}
+    evidence = out.get("evidence")
+    if isinstance(evidence, list):
+        sources = sorted({e["source_file"] for e in evidence if isinstance(e, dict)})
+        if out.get("source_files") == sources:
+            out.pop("source_files", None)
+        out["evidence"] = [
+            {k: v for k, v in e.items() if not (k == "source_format" and v is None)}
+            if isinstance(e, dict)
+            else e
+            for e in evidence
+        ]
+    if out.get("bases") == [out.get("basis")]:
+        out.pop("bases", None)
+    if out.get("test_file") in (out.get("test_id"), None):
+        out.pop("test_file", None)
+    return out
+
+
 def _build_pr_directive(
     response: dict,
     pr_blast_radius: dict,
@@ -628,6 +659,25 @@ def _build_pr_directive(
             f"this repo."
         )
 
+    # What to call next, from this response alone. ``tests_to_run`` is already
+    # the answer to "which tests", so it gets no call of its own.
+    next_calls = [
+        ActionCommand.call(
+            "The diff itself: review priority, health delta and impacted tests",
+            "get_change_risk",
+            cli="repowise risk",
+        )
+    ]
+    if may_break:
+        next_calls.append(
+            ActionCommand.call(
+                "How the files that may break use the changed code",
+                "get_context",
+                {"targets": may_break[:5], "include": ["callers"]},
+                cli=f"repowise context {' '.join(may_break[:5])} --include callers",
+            )
+        )
+
     directive = {
         "may_break": may_break,
         "may_break_tests": may_break_tests,
@@ -641,6 +691,8 @@ def _build_pr_directive(
         "files_without_measured_tests": [],
         "tests_to_run": tests_to_run,
         "tests_to_run_basis": tests_to_run_basis,
+        # A measured row names a coverage-map test id; an inferred one a test file.
+        "tests_to_run_kind": _TESTS_TO_RUN_KIND.get(tests_to_run_basis),
         "tests_to_run_total": tests_to_run_total,
         "tests_to_run_emitted": len(tests_to_run),
         "tests_to_run_truncated": tests_capped,
@@ -674,6 +726,7 @@ def _build_pr_directive(
         "conformance_violations": conformance_violations,
         "dependency_cycles": dependency_cycles,
         "governance_risk": governance_risk,
+        "next_calls": [c.as_dict() for c in next_calls],
         "summary": (
             f"PR touches {len(changed_files)} file(s). "
             f"~{len(may_break)} downstream file(s) may be affected, "
@@ -707,6 +760,35 @@ def _build_pr_directive(
             label=f"directive.{key} beyond cap={cap}",
             preserve_counts=(key in {"missing_tests", "tests_to_run", "test_recommendations"}),
         )
+
+    # Name the repository once instead of on every recommendation: both values
+    # are single arguments to ``analyze_test_impact``, so every row it builds
+    # carries the same pair by construction, not by coincidence.
+    emitted_recommendations = directive.get("test_recommendations") or []
+    if emitted_recommendations:
+        first = emitted_recommendations[0]
+        directive["test_recommendations_repository"] = first.get("repository")
+        directive["test_recommendations_repository_id"] = first.get("repository_id")
+        directive["test_recommendations"] = [
+            _project_recommendation(row) for row in emitted_recommendations
+        ]
+
+    # The same rows also ride under ``pr_blast_radius.test_impact`` as the full
+    # population the directive's cap trimmed. Two copies of one row in one
+    # payload must not disagree about their shape, so the projection applies to
+    # both. ``trimmed_blast`` is a shallow copy of the analyzer's dict, so the
+    # nested block is copied before it is rewritten.
+    blast = response.get("pr_blast_radius")
+    if isinstance(blast, dict):
+        blast_impact = blast.get("test_impact")
+        if isinstance(blast_impact, dict) and blast_impact.get("recommendations"):
+            rows = blast_impact["recommendations"]
+            blast["test_impact"] = {
+                **blast_impact,
+                "recommendations_repository": rows[0].get("repository"),
+                "recommendations_repository_id": rows[0].get("repository_id"),
+                "recommendations": [_project_recommendation(row) for row in rows],
+            }
 
     for key, total in (
         ("will_break_consumers", will_break_total),

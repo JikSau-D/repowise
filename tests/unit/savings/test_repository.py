@@ -82,7 +82,10 @@ def _seed_legacy(db_path: Path) -> None:
 def test_clean_install_has_versioned_event_link_and_query_indexes(tmp_path: Path) -> None:
     store = OmissionStore(tmp_path / "omissions.db")
     try:
-        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert (
+            store._conn.execute("PRAGMA user_version").fetchone()[0]
+            == schema.SAVINGS_SCHEMA_VERSION
+        )
         tables = {
             row[0]
             for row in store._conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -131,7 +134,7 @@ def test_claimed_current_but_incomplete_sidecar_is_repaired(tmp_path: Path) -> N
     db_path = tmp_path / "omissions.db"
     _seed_legacy(db_path)
     with sqlite3.connect(db_path) as conn:
-        conn.execute("PRAGMA user_version=1")
+        conn.execute(f"PRAGMA user_version={schema.SAVINGS_SCHEMA_VERSION}")
     with OmissionStore(db_path) as store:
         assert store._conn.execute("SELECT COUNT(*) FROM savings").fetchone()[0] == 0
         assert store._conn.execute("SELECT COUNT(*) FROM savings_events").fetchone()[0] == 0
@@ -143,13 +146,13 @@ def test_failed_upgrade_rolls_back_tables_rows_and_version(tmp_path: Path, monke
     _seed_legacy(db_path)
     conn = sqlite3.connect(db_path, isolation_level=None)
     apply_sqlite_pragmas(conn, 5000)
-    original = schema._apply_v1
+    original = schema._apply_schema
 
     def fail_after_changes(connection: sqlite3.Connection) -> None:
         original(connection)
         raise RuntimeError("simulated upgrade failure")
 
-    monkeypatch.setattr(schema, "_apply_v1", fail_after_changes)
+    monkeypatch.setattr(schema, "_apply_schema", fail_after_changes)
     with pytest.raises(RuntimeError, match="simulated upgrade failure"):
         schema.initialize_savings_schema(conn)
     assert conn.execute("PRAGMA user_version").fetchone()[0] == 0
@@ -174,7 +177,8 @@ def test_two_concurrent_openers_upgrade_once(tmp_path: Path) -> None:
             return store._conn.execute("PRAGMA user_version").fetchone()[0]
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        assert list(executor.map(open_and_read_version, range(2))) == [1, 1]
+        expected = schema.SAVINGS_SCHEMA_VERSION
+        assert list(executor.map(open_and_read_version, range(2))) == [expected, expected]
     with sqlite3.connect(db_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM savings_events").fetchone()[0] == 0
 
@@ -256,5 +260,70 @@ def test_report_queries_are_read_only_and_breakdowns_are_bounded(tmp_path: Path)
     assert report.priced_saved_output_tokens == 0
     assert report.unpriced_saved_output_tokens == 0
     assert len(report.per_operation) == 3
-    assert len(statements) == 3
+    # Every breakdown honours the cap, not just the first one.
+    for breakdown in (report.per_operation, report.per_surface, report.per_agent):
+        assert len(breakdown) <= 3
+    # Read-only, and every grouped query is bounded. Asserted as properties
+    # rather than as a statement count: the count changes whenever a breakdown
+    # is added, which is not the thing worth protecting.
+    assert statements
     assert all(statement.lstrip().upper().startswith("SELECT") for statement in statements)
+    grouped = [statement for statement in statements if "GROUP BY" in statement.upper()]
+    assert grouped, "expected at least one grouped breakdown query"
+    assert all("LIMIT" in statement.upper() for statement in grouped)
+
+
+@pytest.mark.parametrize("column", ["integration", "agent"])
+@pytest.mark.parametrize(
+    "value",
+    ["", "A", "Windsurf", "a-b", "a b", "a\nb", "a" * 33, "a\x00WINDSURF!!!!", "café"],
+)
+def test_the_sidecar_refuses_a_malformed_agent_id_in_sql(
+    tmp_path: Path, column: str, value: str
+) -> None:
+    """The backstop, tested where it actually lives.
+
+    Every write in the domain goes through ``SavingsEvent.from_mapping``, which
+    rejects these in Python long before SQLite sees them -- so a test that only
+    writes through the contract passes whether the CHECK is right, inverted or
+    absent. These go in by raw SQL, which is the only way to find out.
+
+    The NUL case is why the constraint is not just ``GLOB``: SQLite's
+    ``length()`` and pattern matching both stop at the first NUL, so
+    ``'a\x00WINDSURF!!!!'`` looks one character long and clean to both.
+    """
+    with OmissionStore(tmp_path / "omissions.db") as store:
+        columns = "event_id,schema_version,idempotency_key,occurred_at,repository_id,surface,"
+        columns += "integration,agent,operation,evidence_kind,estimator,token_unit,result_state,"
+        columns += "is_usable,saved_input_tokens,metadata_json"
+        row = {"integration": "codex", "agent": "codex"}
+        row[column] = value
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+            store._conn.execute(
+                f"INSERT INTO savings_events ({columns}) "
+                "VALUES ('e1',1,'k','2026-09-18T00:00:00Z','repo','mcp',?,?,"
+                "'get_risk','measured','t','estimated_tokens','success',1,0,'{}')",
+                (row["integration"], row["agent"]),
+            )
+
+
+def test_the_sidecar_accepts_an_agent_it_has_never_heard_of(tmp_path: Path) -> None:
+    """The constraint's actual purpose: bound the shape, never the membership.
+
+    A SQL vocabulary list would reject this row outright, which is what made the
+    seventh agent expensive.
+    """
+    with OmissionStore(tmp_path / "omissions.db") as store:
+        writer = SavingsRepository(store._conn)
+        assert writer.record_event(
+            SavingsEvent.from_mapping(
+                {**asdict(_event(0)), "integration": "windsurf", "agent": "windsurf"}
+            )
+        ) is True
+        store._conn.execute(
+            "INSERT INTO savings_opportunities VALUES ('o1','2026-09-18T00:00:00Z','repo',"
+            "'never_heard_of_it','bypassed_distillation',5)"
+        )
+        assert store._conn.execute(
+            "SELECT agent FROM savings_events"
+        ).fetchone()[0] == "windsurf"

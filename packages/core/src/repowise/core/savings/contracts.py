@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
+from repowise.core.agents.identity import UNKNOWN_AGENT, is_agent_slug
 from repowise.core.savings.correlation import hash_correlation_evidence, new_event_id
 from repowise.core.savings.formulas import TokenAccounting, calculate_token_accounting
 from repowise.core.savings.normalization import normalize_metadata
@@ -19,10 +20,28 @@ SCHEMA_VERSION = 1
 SURFACES = frozenset({"distill", "hook", "mcp", "vscode_lm"})
 EVIDENCE_KINDS = frozenset({"measured", "inferred"})
 RESULT_STATES = frozenset({"success", "dead_end", "error", "partial", "unknown"})
-IDENTITIES = frozenset(
-    {"claude_code", "codex", "opencode", "hermes", "cursor", "vscode", "unknown"}
-)
 _HASH_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+
+
+def _agent_slug(value: object | None, name: str) -> str:
+    """Validate a stored agent id syntactically, never by membership.
+
+    Deliberately not a closed set. A closed set here would be a second copy of
+    the agent registry: it would go stale the day a seventh agent landed and
+    bucket that agent's traffic as unattributed forever, and an event written by
+    an agent since retired would stop reading back at all. Whether an announced
+    name is *recognised* is a question for
+    :mod:`repowise.core.agents.identity`, asked once when a client announces
+    itself — not again on every read of a value we ourselves wrote.
+
+    Applied identically on the way in and on the way out, which is the point:
+    the two used to disagree, raising on an unrecognised id while the report
+    silently coerced one to ``unknown``.
+    """
+    slug = str(value if value is not None else UNKNOWN_AGENT)
+    if not is_agent_slug(slug):
+        raise ValueError(f"{name} must be a bounded lowercase agent slug: {slug!r}")
+    return slug
 
 
 def utc_text(value: str | datetime) -> str:
@@ -87,16 +106,14 @@ def _semantics(value: Mapping[str, Any]) -> _Semantics:
     surface = str(value["surface"])
     evidence_kind = str(value["evidence_kind"])
     result_state = str(value["result_state"])
-    integration = str(value.get("integration", "unknown"))
-    agent = str(value.get("agent", "unknown"))
+    integration = _agent_slug(value.get("integration"), "integration")
+    agent = _agent_slug(value.get("agent"), "agent")
     if surface not in SURFACES:
         raise ValueError(f"unsupported surface: {surface}")
     if evidence_kind not in EVIDENCE_KINDS:
         raise ValueError(f"unsupported evidence kind: {evidence_kind}")
     if result_state not in RESULT_STATES:
         raise ValueError(f"unsupported result state: {result_state}")
-    if integration not in IDENTITIES or agent not in IDENTITIES:
-        raise ValueError("integration and agent must use the v1 identity vocabulary")
     is_usable = value.get("is_usable")
     if not isinstance(is_usable, bool):
         raise ValueError("is_usable must be explicit")
@@ -277,9 +294,7 @@ class OpportunityObservation:
     def from_mapping(
         cls, value: Mapping[str, Any], *, repository_id: str | None = None
     ) -> OpportunityObservation:
-        integration = str(value.get("integration", "unknown"))
-        if integration not in IDENTITIES:
-            integration = "unknown"
+        integration = _agent_slug(value.get("integration"), "integration")
         tokens = value.get("estimated_potential_input_tokens", 0)
         if isinstance(tokens, bool) or not isinstance(tokens, int):
             raise TypeError("estimated opportunity tokens must be an integer")
@@ -296,6 +311,18 @@ class OpportunityObservation:
 
 @dataclass(frozen=True, slots=True)
 class SavingsReport:
+    """One repository's savings over one window, from one set of queries.
+
+    Every first-party surface -- the costs endpoint, the repository overview
+    headline and ``repowise saved`` -- reports from this object and does no
+    accounting arithmetic of its own. They used to each aggregate and price the
+    ledger independently, and produced three different dollar figures for the
+    same repository; that is what this type exists to prevent.
+
+    The breakdowns are bounded tuples, not generators, so a caller cannot turn
+    a report into an unbounded payload by iterating harder.
+    """
+
     unique_events: int
     successful_or_usable_partial_events: int
     saving_interactions: int
@@ -313,4 +340,43 @@ class SavingsReport:
     priced_output_savings_usd: float
     opportunity_count: int
     opportunity_tokens_excluded: int
+    #: How much smaller the input got. The headline total answers "how many
+    #: tokens"; this answers "out of how many", which is the only form in which
+    #: one repository's savings compare with another's.
+    #:
+    #: Two populations, and both ship because either alone misleads.
+    #: ``baseline_events`` counts every interaction that had something to
+    #: compare against; ``reducing_events`` counts the subset where the input
+    #: actually got smaller. The ratio below is over the subset -- "when it
+    #: fires, by how much" -- and is only honest while the surface states the
+    #: coverage beside it, which is what the two counts are for. An event with
+    #: no baseline at all is in neither: it is not a reduction of nought.
+    baseline_events: int = 0
+    reducing_events: int = 0
+    #: Both sides of the ratio, over ``reducing_events``, so the percentage is
+    #: checkable rather than asserted.
+    baseline_input_tokens: int = 0
+    baseline_saved_input_tokens: int = 0
+    #: ``baseline_saved_input_tokens / baseline_input_tokens``, and the
+    #: nearest-rank 90th percentile of the same ratio taken per event. Both
+    #: null when nothing in the window reduced anything. The aggregate is what
+    #: a reduction is typically worth; the percentile says how far it goes on
+    #: the outputs where it matters, and one without the other is a half-truth
+    #: in whichever direction flatters.
+    input_reduction_ratio: float | None = None
+    input_reduction_ratio_p90: float | None = None
     per_operation: tuple[Mapping[str, Any], ...] = ()
+    per_surface: tuple[Mapping[str, Any], ...] = ()
+    #: Rows carry ``agent_display_name`` beside the slug, resolved from the
+    #: identity registry here so no consumer needs a label map of its own --
+    #: there were three of those before this, one of them in TypeScript.
+    per_agent: tuple[Mapping[str, Any], ...] = ()
+    #: ``model`` is null on an unpriced event, which is a real bucket rather
+    #: than a gap to hide: it is how much saving carries no rate evidence.
+    per_model: tuple[Mapping[str, Any], ...] = ()
+    per_day: tuple[Mapping[str, Any], ...] = ()
+    per_opportunity_kind: tuple[Mapping[str, Any], ...] = ()
+    #: Freshness, for saying how current the figures are rather than implying
+    #: they are live. Null when the window holds no events at all.
+    first_event_at: str | None = None
+    last_event_at: str | None = None

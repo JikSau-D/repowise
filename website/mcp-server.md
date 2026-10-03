@@ -374,16 +374,14 @@ refresh.
 the benchmarked, population-relative authority for live change review.
 `fix_history` reports the recency-weighted bug-fix record of the
 files touched, which is what distinguishes a small dangerous change from a large
-boring one. The supporting `score` is an offline-calibrated 0-10 diff-size and
-spread output, not a probability (see `score_measures`), with
-the `score_unit` it is calibrated on, repo-relative `risk_percentile` /
-`review_priority` / `classification` for that diff shape, a `fallback_band` when
-there was no baseline to rank against, plus `impacted_tests` when a per-test
-coverage map is ingested (`repowise coverage add`). `risk_authority` names the
-field to act on; `include=["scales"]` supplies the kind, units, range,
-calibration, authority, and shared thresholds for each value. `fallback_band`
-is an absolute per-commit classification, not the population-relative
-percentile classification.
+boring one. `diff_shape` is one sentence on size and spread, beside repo-relative
+`risk_percentile` / `review_priority` / `classification`, plus
+`impacted_tests` when a per-test coverage map is ingested
+(`repowise coverage add`). The raw 0-10 `score` and its absolute
+`fallback_band` sit behind `include=["diagnostics"]`: the score ranks 0.99
+against lines added, so the percentile already carries the ranking.
+`include=["scales"]` supplies the kind, units, range, calibration, authority
+and shared thresholds for each value.
 
 **When to use:** Before merging a commit or PR range, or on work you have not
 committed yet.
@@ -442,19 +440,21 @@ Full parameter tables and return shapes live in the repo guide:
 
 ## Supplementary tools
 
-### `list_repos()` (default)
+### `list_repos()` (default in a workspace)
 
-Lists the repos this server is serving. In workspace mode returns every
-configured alias; in single-repo mode a single `"default"` alias.
+Lists every configured alias in a workspace. It is not advertised in
+single-repo mode, where the server is bound to the only repository.
 
-### Workspace-only (default in a workspace)
+### Workspace-only (opt-in)
 
-When the server starts inside a workspace, two more tools appear automatically:
+These need a workspace and are off by default there too. Enable them the same
+way as the opt-in tools below:
 
 | Tool | Purpose |
 |------|---------|
 | `get_architecture()` | Whole-system coupling, cyclic core, 1–10 architecture score |
 | `get_blast_radius(targets, …)` | Cross-repo downstream impact of changing a service |
+| `get_conformance(…)` | Architecture-rule violations and dependency cycles |
 
 ### Opt-in tools (off by default)
 
@@ -467,7 +467,7 @@ or `repowise mcp --tools "+name"`:
 | `get_dependency_path(source, target)` | Shortest graph path between two files/modules |
 | `get_execution_flows(…)` | Top entry points and call traces |
 | `generate_refactoring_code(…)` | Code for a ranked refactoring plan from `get_health` |
-| `get_conformance(…)` | Architecture-rule violations (useful in workspace mode) |
+| `set_finding_status(…)` | Record a triage status on a refactoring plan |
 
 ---
 
