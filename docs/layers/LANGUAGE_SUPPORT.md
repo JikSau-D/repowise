@@ -79,6 +79,10 @@ meaningless for a script invoked by name. See
 [Beyond code files](#beyond-code-files), along with
 [config and data formats](#config-and-data).
 
+Cross-repo contracts (HTTP routes and calls, database tables, queues, sockets)
+are listed per language and framework in
+[WORKSPACES.md](../scale/WORKSPACES.md#api-contract-extraction).
+
 ## What the pipeline gives each tier
 
 | Stage | Full | Good | Partial | Lightweight | Structural |
@@ -94,8 +98,11 @@ meaningless for a script invoked by name. See
 | Semantic search & wiki pages | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 Scala's import resolution is partial: it shares the JVM index with Java and
-Kotlin and falls back to parsing SBT / Mill build files. Every other Full and
-Good language resolves imports outright. On the Partial rung the two languages
+Kotlin and falls back to parsing SBT / Mill build files. Elixir and F# also
+have dedicated resolvers with known gaps, described in their rows below.
+Object Pascal and Objective-C resolve through the generic unit-name or
+header-stem match, and COBOL resolves literal program calls, not imports.
+Every other Full and Good language has a dedicated import resolver. On the Partial rung the two languages
 split: Luau resolves `require()` and has no health markers, Razor has C#
 health markers and no import edges yet.
 
@@ -188,7 +195,7 @@ extractors and code-health markers.
 | Language | Extensions | Import resolution |
 |----------|-----------|--------------|
 | **Python** | `.py` `.pyi` | Source-root-aware module index (`src/`, monorepo `packages/*/src`, PEP 420), `__init__.py` re-export barrels |
-| **TypeScript** | `.ts` `.tsx` | ESM / `require()`, tsconfig path aliases, npm/yarn/pnpm workspaces, `export * from` barrels |
+| **TypeScript** | `.ts` `.tsx` `.mts` `.cts` | ESM / `require()`, tsconfig path aliases, npm/yarn/pnpm workspaces, `export * from` barrels |
 | **JavaScript** | `.js` `.jsx` `.mjs` `.cjs` | `import` / `require()` including CommonJS re-export shapes and member picks |
 | **Svelte** | `.svelte` | The TS/JS resolver plus SvelteKit's `$lib` and Node `#`-prefixed subpath imports |
 | **Vue** | `.vue` | The TS/JS resolver plus `jsconfig`/`tsconfig` aliases, directory-index components, router `import()` specifiers |
@@ -196,7 +203,7 @@ extractors and code-health markers.
 | **Kotlin** | `.kt` `.kts` | Shares the JVM workspace index with Java, so resolution is cross-language |
 | **Go** | `.go` | Multi-module `go.mod` discovery; a package import fans out to every file in the package |
 | **Rust** | `.rs` | `use crate::` / `super::` / `self::` with `Cargo.toml` |
-| **C++** | `.cpp` `.cc` `.cxx` `.h` `.hpp` `.hxx` `.inl` `.ipp` `.tpp` | `#include` via `compile_commands.json` plus CMake / Bazel header maps, header↔implementation pairing |
+| **C++** | `.cpp` `.cc` `.cxx` `.h` `.hh` `.hpp` `.hxx` `.inl` `.ipp` `.tpp` `.inc` | `#include` via `compile_commands.json` plus CMake / Bazel header maps, header↔implementation pairing |
 | **C#** | `.cs` | `using` / `global using` / aliases via `.csproj` / `.sln`, MSBuild project graph, `partial` class linking |
 | **Scala** | `.scala` | The shared JVM index (cross-language with Java/Kotlin), SBT / Mill build parsing as fallback |
 | **Ruby** | `.rb` | `require` / `require_relative` with `$LOAD_PATH` probing, Gemfile externals, Rails / Zeitwerk autoloading |
@@ -217,7 +224,7 @@ their relationships:
 | C# | ASP.NET (attribute + minimal API), EF Core, gRPC-dotnet, host-builder extensions, CommunityToolkit MVVM |
 | Go | net/http, gin, echo, chi, gRPC server registration |
 | Rust | Axum, Actix route → handler |
-| JS / TS / Svelte | Next.js App Router, Hono / Fastify / Koa / Elysia, Remix / SvelteKit / Astro, tRPC, Express / NestJS |
+| JS / TS / Svelte | Next.js App Router, Hono / Fastify / Koa / Elysia, Remix / SvelteKit / Astro, tRPC, Express / NestJS, Angular |
 | C++ | GoogleTest, Catch2, Boost.Test, doctest, Google Benchmark, libFuzzer |
 
 The dead-code analyzer knows each ecosystem's entry points, generated-file
@@ -254,7 +261,7 @@ bindings, heritage and a workspace resolver where their syntax supports them.
 |----------|-----------|--------------|
 | **C** | `.c` | `#include` via `compile_commands.json` (shares the C++ grammar) |
 | **Swift** | `.swift` | SPM `Package.swift` target → directory mapping, intra-module type references, `@main` entry points |
-| **PHP** | `.php` | `use Foo\Bar\Baz` with composer.json PSR-4 longest-prefix resolution; Laravel, TYPO3 edges |
+| **PHP** | `.php` | `use` declarations (grouped `use A\{B, C}` included) resolved through PSR-4 from the root and nested `composer.json` files, longest prefix first as composer does; same-namespace and `\Fully\Qualified` class references; Laravel edges (route files to controllers and aliased middleware, registered and discovered listeners, policies, providers, commands by signature), TYPO3 edges |
 | **Dart** | `.dart` | `import` / `export` / `part` URIs, `package:` via every `pubspec.yaml`, Flutter route tables and `runApp()` edges. **Health markers included** |
 | **COBOL** | `.cbl` `.cob` `.cobol` `.cpy` | Program IDs, sections, paragraphs and data levels; literal `CALL` and `PERFORM` targets resolve to program/procedure symbols. Dynamic calls and `COPY` edges are deliberately silent |
 
@@ -264,7 +271,7 @@ and local procedure transfers resolve, while copybook resolution, dynamic
 `CALL data-item`, dialect-specific syntax and source-format preprocessing are
 explicitly deferred. Dead-code findings are also suppressed because JCL and
 scheduler entry points usually live outside the indexed source graph.
-| **Object Pascal** | `.pas` `.pp` `.dpr` `.dpk` `.lpr` `.inc` | `uses` clauses via the generic unit-name → file-stem fallback; project files as entry points. **Health markers included** |
+| **Object Pascal** | `.pas` `.pp` `.dpr` `.dpk` `.lpr` | `uses` clauses via the generic unit-name → file-stem fallback; project files as entry points. **Health markers included** |
 | **GDScript** | `.gd` | `preload(...)` / `load(...)` / `extends "res://..."` resolved as absolute paths from the nearest `project.godot`, so a repo holding many Godot projects keeps each project's `res://` namespace separate, plus scene, autoload and `class_name` edges (see [GDScript / Godot](../architecture/language-support.md#gdscript--godot)) |
 | **VB.NET** | `.vb` | `Imports` through the same MSBuild project index C# uses: `.vbproj` / `.sln` parsing, `<RootNamespace>`-aware namespace lookup, NuGet package references |
 | **Elixir** | `.ex` `.exs` | `alias` / `import` / `require` / `use` against a `defmodule` index, with the Mix `lib/foo/bar.ex` → `Foo.Bar` convention as the fallback; `alias Foo.{Bar, Baz}` names both modules (no heritage: `use` and `@behaviour` are not inheritance) |
@@ -289,8 +296,8 @@ than tree-sitter.
   import edges, so model-level lineage, hotspots, co-change, ownership and
   communities all fall out free.
 - **App-to-database contracts** (workspace mode), table *providers* (DDL,
-  Alembic, ORM entities) pair with table *consumers* (SQL literals in app code)
-  on the Live System Map. See [WORKSPACES.md](../scale/WORKSPACES.md).
+  migrations, ORM models) pair with table *consumers* (SQL literals and query
+  builders in app code) on the Live System Map. See [WORKSPACES.md](../scale/WORKSPACES.md).
 - **Health markers**: stored routines get cyclomatic complexity, plus
   `sql_select_star`, `sql_update_delete_without_where` and `sql_cartesian_join`.
   All of them are **uncalibrated by construction** (no defect corpus covers
@@ -369,7 +376,7 @@ map before markers fire. This table is why a language is Full rather than Good.
 | Scala | ✅ | ✅ | ✅ | later | later | later | ✅ |
 | Ruby | ✅ | ✅ | ✅ | later | later | later | ✅ |
 | Dart | ✅ | n/a | ✅ | later | later | later | ✅ |
-| Object Pascal | ✅ | n/a | later | n/a | n/a | later | n/a |
+| Object Pascal | ✅ | n/a | ✅ | n/a | n/a | later | ✅ |
 | Razor | ✅ | n/a | n/a | n/a | n/a | later | ✅ |
 | Shell | ✅ | n/a | n/a | n/a | n/a | n/a | n/a |
 
@@ -824,6 +831,19 @@ cannot check.
 - **Razor has no import edges**, and an attribute-bound handler carries none.
 - **Object Pascal's `extends`/`implements` split is a naming heuristic**,
   inferred from the `I`-prefix convention rather than a language guarantee.
+- **Object Pascal's DB/network performance sinks are gated on file-wide
+  `uses`-clause evidence, not per-receiver evidence.** A file importing
+  `FireDAC` gates every `.Open` / `.ExecSQL` / `.Post` call in it, not only
+  calls on an actual `TFDQuery`, because a Pascal variable's declared type has
+  no textual link back to the unit it came from the way `client = requests.Session()`
+  does in Python.
+- **Object Pascal has no `assertion_free_test`.** `large_assertion_block` /
+  `duplicated_assertion_block` / `mock_saturated_test` all read the same
+  assertion counts and work for it; `assertion_free_test` additionally gates
+  on a `SHIPPING_LANGUAGES` allowlist that needs its own measured-precision
+  pass (see the module docstring) before Pascal joins it. It has no mock
+  dialect either, so `mock_saturated_test`'s mock-setup half stays at zero --
+  advisory and harmless, never a false `mock_saturated_test` positive.
 - **A GDScript `uid://` resolves through the `.uid` sidecar Godot writes for
   scripts**, so a `preload` naming one reaches its file. A uid naming a scene
   does not: Godot writes no sidecar for `.tscn` / `.tres`, and the
@@ -855,7 +875,7 @@ Per-language mechanics behind these:
 | C# | Full (health) | Dataflow dialect |
 | Dart | Good | riverpod / get_it dynamic hints, dataflow dialect |
 | GDScript | Good | The health dialects (complexity, performance, dataflow) that would take it to Full; the grammar supports all three |
-| Object Pascal | Good | Assertion and performance markers, a dedicated `uses` resolver |
+| Object Pascal | Good | A dedicated `uses` resolver; `assertion_free_test` needs a measured-precision pass before it joins its language allowlist |
 | COBOL | Good | Copybook resolution, source-format normalization, dialect coverage, health markers |
 | VB.NET | Good | Health markers, project-level `<Import Include=...>` as implicit imports |
 | Elixir | Good | Health markers, and a call-resolution strategy beyond same-file |

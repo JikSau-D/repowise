@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import os.path
 from collections.abc import Collection
 from pathlib import Path
 from typing import Any
@@ -13,9 +12,8 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from repowise.core.analysis.decisions.lifecycle import is_governing
+from repowise.core.analysis.decisions.lifecycle import HISTORY_CURRENCIES, is_governing
 from repowise.core.analysis.decisions.scope import binds_to_paths
-from repowise.core.ingestion.languages.registry import REGISTRY as _LANG_REGISTRY
 from repowise.core.persistence.models import (
     Repository,
 )
@@ -28,14 +26,13 @@ from repowise.core.persistence.sql import (  # noqa: F401
     is_missing_table,
 )
 from repowise.server.mcp_server import _state
+from repowise.server.mcp_server._query_shape import _is_path  # noqa: F401
 
 _log = logging.getLogger("repowise.mcp")
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-
-_CODE_EXTS = _LANG_REGISTRY.all_code_extensions()
 
 # Ceiling on one vector-store query, seconds. The first query in a process pays
 # for the store open, the first embed and the first ANN probe; #1678 measured
@@ -107,30 +104,6 @@ def embed_timeout_s() -> float:
     return min(seconds, _EMBED_TIMEOUT_MAX_S)
 
 
-# Words that mark a string as a natural-language question rather than a path.
-# Keep this small — false positives here send genuine paths to the NL branch,
-# which is harmless (path lookup also runs as a fallback) but slower.
-_NL_QUESTION_TOKENS = frozenset(
-    {
-        "why",
-        "how",
-        "what",
-        "when",
-        "where",
-        "who",
-        "which",
-        "should",
-        "can",
-        "does",
-        "do",
-        "is",
-        "are",
-        "was",
-        "were",
-    }
-)
-
-
 # ---------------------------------------------------------------------------
 # Repository resolution
 # ---------------------------------------------------------------------------
@@ -166,43 +139,6 @@ async def _get_repo(session: AsyncSession, repo: str | None = None) -> Repositor
 # ---------------------------------------------------------------------------
 # Path detection
 # ---------------------------------------------------------------------------
-
-
-def _is_path(query: str) -> bool:
-    """Heuristic: does this string look like a file or module path?
-
-    Natural-language questions take precedence over the slash heuristic
-    because phrases like "two-phase plan/apply flow" or "client/server
-    boundary" contain a slash without being paths. We treat anything with
-    a question mark, that starts with a question word, or that has 4+
-    whitespace-separated tokens including a question word, as NL.
-    """
-    stripped = query.strip()
-    if not stripped:
-        return False
-
-    # Trailing "?" is an unambiguous NL signal.
-    if stripped.endswith("?"):
-        return False
-
-    tokens = stripped.split()
-
-    # First token is a question word → NL.
-    if tokens and tokens[0].lower().rstrip(",.;:") in _NL_QUESTION_TOKENS:
-        return False
-
-    # Sentence-shaped input (multiple words including a question word) → NL.
-    if len(tokens) >= 4 and any(t.lower().rstrip(",.;:") in _NL_QUESTION_TOKENS for t in tokens):
-        return False
-
-    # A path can't contain whitespace.
-    if any(ch.isspace() for ch in stripped):
-        return False
-
-    if "/" in stripped or "\\" in stripped:
-        return True
-    _, ext = os.path.splitext(stripped)
-    return ext in _CODE_EXTS
 
 
 # ---------------------------------------------------------------------------
@@ -493,6 +429,7 @@ def _build_origin_story(
         "available": True,
         "primary_author": primary,
         "author_commit_pct": git_meta.primary_owner_commit_pct,
+        "author_line_pct": getattr(git_meta, "primary_owner_line_pct", None),
         "contributors": authors,
         "total_commits": total,
         "first_commit": first_date,
@@ -583,7 +520,8 @@ def _alignment_score(
             else ""
         )
         return "low", (
-            "Every accepted decision here is deprecated/superseded. "
+            "Every accepted decision here is deprecated/superseded, or names only "
+            "files that no longer exist. "
             "This file likely contains technical debt that should be migrated." + trailer
         )
     if candidates:
@@ -633,7 +571,7 @@ def _compute_alignment(
     deprecated = [
         d
         for d in governing
-        if currencies.get(d["id"]) in ("superseded", "dismissed")
+        if currencies.get(d["id"]) in HISTORY_CURRENCIES
     ]
     # Repository-wide, not scoped to the matched records: the sibling
     # denominator is drawn from decisions naming *other* files in the same
@@ -672,7 +610,8 @@ def _compute_alignment(
         "governing_count": len(governing),
         "active_count": len(accepted),
         "candidate_count": len(candidates),
-        # Accepted once and withdrawn since, whether superseded or dismissed.
+        # Accepted once and now history: superseded, dismissed, or naming only
+        # files gone at HEAD.
         "deprecated_count": len(deprecated),
         "uncheckable_count": len(uncheckable),
         "stale_count": len(stale),

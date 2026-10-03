@@ -55,11 +55,22 @@ STORE_FORMAT_VERSION: int = 2
 #: on the next update, so an existing index does not keep half its Python files
 #: without external edges.
 #:
-#: v4: a literal module-level ``__all__`` now raises the names it lists to
-#: ``public``, so a cached ``ParsedFile`` from an earlier build carries the
-#: old name-based visibility for every underscore-prefixed name a module
-#: explicitly exports.
-PARSER_SCHEMA_VERSION: int = 4
+#: v4: Python absolute imports resolve only by their full dotted path (no stem
+#: guess, no sibling lookup inside a package, never the importer itself), and
+#: ``from pkg import a, b`` over submodules no longer edges into
+#: ``pkg/__init__.py``. Reconciling once drops the stale edges from old stores.
+#:
+#: v5: an overload signature (Python ``@overload``, TypeScript function / method
+#: overload) is marked ``is_declaration`` so lookups serve the implementation.
+#:
+#: v6: a member call a bare-call pattern also matched (Java ``obj.m()``, Ruby
+#: ``obj.m(x)``) is kept once, with its receiver and ``bare_name_fallback``, so
+#: a cached receiver-less copy no longer resolves by bare name beside it. Also,
+#: Java, C# and C++ overloads of different arity get their own ids (``notNull#1``,
+#: ``notNull#2``) and a C# generic type beside a same-named one gets its arity
+#: (``IFoo`1``); the first update re-keys symbols and graph nodes repo-wide. A
+#: C++ template function is one ``function`` symbol, no longer also a ``class``.
+PARSER_SCHEMA_VERSION: int = 6
 
 #: state.json key holding the store format version that wrote the store.
 STORE_FORMAT_VERSION_KEY = "store_format_version"

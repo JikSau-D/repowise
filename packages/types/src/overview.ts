@@ -127,7 +127,7 @@ export interface OverviewAttentionItem {
    * levels this used to declare. Sources that publish their own severity are
    * passed through unchanged; the two that genuinely have none (dead code and
    * documentation drift carry a confidence float instead) are bucketed onto it
-   * server-side. See `server/services/attention.py`.
+   * server-side. See `core/analysis/attention/compose.py`.
    */
   severity: HealthSeverity;
   /** Decision id, file path, … — what the item points at. */
@@ -250,7 +250,10 @@ export interface OverviewSummaryResponse {
   repo: OverviewRepoMeta;
   stats: OverviewStats;
   health: OverviewHealth;
+  /** Code languages only. */
   languages: OverviewLanguage[];
+  /** Config, markup and data formats, kept apart from `languages`. */
+  docs_config_languages?: OverviewLanguage[];
   attention: OverviewAttentionItem[];
   /** Optional: a server predating the merged attention list omits it, and the
    *  UI then falls back to counting the rows it was given. */

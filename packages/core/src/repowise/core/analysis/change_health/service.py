@@ -14,6 +14,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 
 from ...test_paths import is_test_related_path
+from ..finding_registry import excluded_types
 from ..health import HEALTH_ANALYZER_VERSION, HealthFindingData
 from ..health.perf.causal import PERFORMANCE_MODEL_VERSION
 from ..health.scoring import ADVISORY_DIMENSION, is_advisory
@@ -58,14 +59,23 @@ _INCIDENTAL_BASES = {"file_change", "context_change", "unknown"}
 
 @dataclass(frozen=True, slots=True)
 class DeltaRequest:
-    repo_path: str
+    """What to compare. ``repo_path`` is unused by the comparison; ``None`` is fine."""
+
+    repo_path: str | None
     revspec: str | None
     extensions: tuple[str, ...] = ()
     exclude_patterns: tuple[str, ...] = ()
+    #: Gitignore-style paths to keep; empty keeps every path.
+    include_paths: tuple[str, ...] = ()
 
 
 class ChangeHealthDeltaService:
-    """Compare the health of two revisions of the same repository."""
+    """Compare the health of two revisions of the same repository.
+
+    Without a checkout, pass a ``MappingRevisionSource`` (diff hunks plus raw
+    bytes at both SHAs). Both sides are re-scored from those bytes, so custom
+    health rules need ``RevisionHealthAnalyzer(config=...)`` to match the index.
+    """
 
     def __init__(
         self,
@@ -265,18 +275,23 @@ class ChangeHealthDeltaService:
         # file cannot contribute a one-sided "introduced" or "resolved".
         # Advisory markers deduct nothing, so adding one is not a regression
         # and removing one is not a fix. Dropped from BOTH sides before
-        # matching, so every counter derived from the match agrees.
+        # matching, so every counter derived from the match agrees. Types the
+        # finding-type registry withholds go the same way, for the same reason.
+        withheld = excluded_types()
         base_findings = [
             f
             for f in base_run.findings
             if rename.get(f.file_path, f.file_path) in subject
             and not is_advisory(f.biomarker_type)
             and not _is_test_perf(f)
+            and f.biomarker_type not in withheld
         ]
         head_findings = [
             f
             for f in head_run.findings_for(subject)
-            if not is_advisory(f.biomarker_type) and not _is_test_perf(f)
+            if not is_advisory(f.biomarker_type)
+            and not _is_test_perf(f)
+            and f.biomarker_type not in withheld
         ]
         match = matcher.match(base_findings, head_findings)
 
@@ -360,11 +375,12 @@ class ChangeHealthDeltaService:
 
 
 def _filter(changes: list[FileChange], request: DeltaRequest) -> list[FileChange]:
-    """Apply the caller's extension and exclusion filters to the change set."""
+    """Apply the caller's extension, inclusion and exclusion filters to the change set."""
     return filter_changes(
         changes,
         extensions=request.extensions,
         exclude_patterns=request.exclude_patterns,
+        include_paths=request.include_paths,
     )
 
 
@@ -409,7 +425,7 @@ def _limits() -> list[str]:
 def _is_test_perf(finding: HealthFindingData) -> bool:
     """A performance finding on test code.
 
-    The perf model reasons about request-reachable hot paths, which a test file
+    Performance findings are about code that serves requests, which a test file
     is not, so these are dropped from both sides rather than ranked. Other
     dimensions still report on tests; only their ordering is demoted.
     """
@@ -454,6 +470,8 @@ def _suggestion(finding: HealthFindingData, perf: PerfOpportunityView | None) ->
     if perf is not None:
         if perf.actionability_state == "plan_ready" and perf.intervention_symbol:
             return f"Hoist or batch the repeated call in {perf.intervention_symbol}."
+        if perf.actionability_state == "expected":
+            return "Nothing to change: the repetition is inherent or already batched."
         return perf.actionability_reason or "Confirm the cost before changing it."
     return finding.reason or f"Review the {finding.biomarker_type.replace('_', ' ')}."
 

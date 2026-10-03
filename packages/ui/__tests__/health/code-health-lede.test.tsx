@@ -105,3 +105,45 @@ describe("CodeHealthLede — the two readings of one figure", () => {
     expect(screen.getByText(/287 files are not scored here/)).toBeTruthy();
   });
 });
+
+describe("CodeHealthLede — the figure and its band agree at the edge", () => {
+  it("does not print 7.0 beside Fair for a score just under Good", () => {
+    const { container } = render(<CodeHealthLede summary={summary({ average_health: 6.98 })} />);
+    expect(container.textContent).toContain("scores 6.9 out of 10");
+    expect(container.textContent).toContain("That puts it in the Fair band.");
+    expect(container.textContent).not.toContain("7.0 out of 10");
+  });
+});
+
+describe("CodeHealthLede: the worst test file", () => {
+  it("names the lowest-scoring test file apart from production", () => {
+    const { container } = render(
+      <CodeHealthLede
+        summary={summary({ worst_test_path: "tests/test_big.py", worst_test_score: 2.4 })}
+      />,
+    );
+    expect(screen.getByText("tests/test_big.py")).toBeInTheDocument();
+    expect(container.textContent).toContain("Test files are ranked apart.");
+    expect(container.textContent).toContain("at 2.4.");
+  });
+
+  it("says nothing about tests when there are none, or the server predates it", () => {
+    const { container } = render(<CodeHealthLede summary={summary({ worst_test_path: null })} />);
+    expect(container.textContent).not.toContain("Test files are ranked apart");
+  });
+});
+
+describe("CodeHealthLede secondary, when Fix first leads the page", () => {
+  it("keeps one line with the score and its band, and the ribbon behind More", () => {
+    const { container } = render(<CodeHealthLede summary={summary()} variant="secondary" />);
+    const summaryLine = container.querySelector("summary")!;
+    expect(summaryLine.textContent).toContain("7.0");
+    expect(summaryLine.textContent).toContain("out of 10 across 3,787 files");
+    expect(summaryLine.textContent).toContain("More");
+    // The other figures still exist, inside the closed disclosure.
+    const details = container.querySelector("details")!;
+    expect(details.open).toBe(false);
+    expect(details.textContent).toContain("Maintainability");
+    expect(details.textContent).toContain("Hotspot health");
+  });
+});

@@ -4,11 +4,11 @@ Most languages can determine visibility from a symbol's name + modifier
 text alone (the ``visibility_fn`` shape). Some cannot, because the answer
 depends on surrounding AST context — C/C++ ``public:`` / ``private:``
 access specifier siblings, ``static`` storage class at file scope and
-``__declspec(dllexport)`` attributes; C#'s no-modifier default, which
-differs by enclosing declaration; TS/JS export position; Python's
-module-level ``__all__``, which can export a name the identifier alone
-would call private; Rust's trait items, which may not write a modifier of
-their own. Each has a ``refine_*_visibility`` the parser calls after the
+``__declspec(dllexport)`` attributes; the C# and Java no-modifier
+defaults, which differ by enclosing declaration; TS/JS export position;
+Python's module-level ``__all__``, which can export a name the identifier
+alone would call private; Rust's trait items, which may not write a modifier
+of their own. Each has a ``refine_*_visibility`` the parser calls after the
 generic ``visibility_fn``.
 """
 
@@ -157,9 +157,10 @@ def refine_py_visibility(
     return "public"
 
 
-def ts_visibility(_name: str, mods: list[str]) -> str:
+def ts_visibility(name: str, mods: list[str]) -> str:
     mods_lower = [m.lower() for m in mods]
-    if "private" in mods_lower:
+    # ``#x`` is an ECMAScript private member: private without any modifier.
+    if "private" in mods_lower or name.startswith("#"):
         return "private"
     if "protected" in mods_lower:
         return "protected"
@@ -184,12 +185,20 @@ def rust_visibility(_name: str, mods: list[str]) -> str:
 
 
 def java_visibility(_name: str, mods: list[str]) -> str:
+    """Java visibility; no access keyword is package-private, recorded ``internal``.
+
+    That default is the top-level type one. Interface members and enum
+    constructors default differently, which ``refine_java_visibility``
+    corrects from the AST.
+    """
     combined = " ".join(mods).lower()
     if "private" in combined:
         return "private"
     if "protected" in combined:
         return "protected"
-    return "public"
+    if "public" in combined:
+        return "public"
+    return "internal"
 
 
 def public_by_default(_name: str, _mods: list[str]) -> str:
@@ -313,6 +322,12 @@ _TS_CJS_EXPORTS_RE = re.compile(r"\bmodule\.exports\b|\bexports\s*[.\[]")
 # publishes a name for a symbol the file declares itself; the other is a
 # re-export the import pipeline already carries.
 _TS_EXPORT_LIST_SOURCE_RE = re.compile(r"\bexport\s*\{([^}]*)\}\s*(from\b)?")
+# ``export default name`` with nothing after the name: the statement form of
+# ``export { name as default }``. A declaration (``export default function f``)
+# or an expression (``export default f()``) does not match.
+_TS_EXPORT_DEFAULT_NAME_RE = re.compile(
+    r"^[ \t]*export[ \t]+default[ \t]+([A-Za-z_$][\w$]*)[ \t]*;?[ \t]*\r?$", re.MULTILINE
+)
 
 # Dropped outright rather than blanked: nothing downstream of the alias scan
 # reads a line number, and collapsing a comment between a clause and its
@@ -366,11 +381,13 @@ def ts_export_aliases(src: str) -> dict[str, str]:
 
     Clauses that do not rename are omitted: the two names agree, so the symbol
     table already answers and an entry would only duplicate it.
+    ``export default name`` is the same clause written as a statement, so it is
+    recorded as ``{"default": name}``.
     """
-    # Every alias is written ``local as exported``, so a file without that
-    # token cannot hold one and need not be scanned. Most files do not, and
-    # the scan is over the whole source.
-    if " as " not in src:
+    # Every alias is written ``local as exported`` or ``export default name``,
+    # so a file with neither token cannot hold one and need not be scanned.
+    # Most files do not, and the scan is over the whole source.
+    if " as " not in src and "export default" not in src:
         return {}
 
     # Comments are stripped first, and this map is the reason it is worth the
@@ -379,17 +396,22 @@ def ts_export_aliases(src: str) -> dict[str, str]:
     # a local symbol as some module's published API and mint a call edge to it.
     cleaned = _TS_LINE_COMMENT.sub("", _TS_BLOCK_COMMENT.sub("", src))
 
-    aliases: dict[str, str] = {}
+    pairs = [(m.group(1), "default") for m in _TS_EXPORT_DEFAULT_NAME_RE.finditer(cleaned)]
     for m in _TS_EXPORT_LIST_SOURCE_RE.finditer(cleaned):
         if m.group(2):  # ``export { a as b } from "./x"`` — a re-export
             continue
         for part in m.group(1).split(","):
             local, separator, exported = (p.strip() for p in part.partition(" as "))
-            if not separator or not local.isidentifier() or not exported.isidentifier():
-                continue
-            # A name published twice under one spelling has no single answer,
-            # and guessing costs a wrong edge where refusing costs none.
-            aliases[exported] = local if aliases.get(exported, local) == local else ""
+            if separator:
+                pairs.append((local, exported))
+
+    aliases: dict[str, str] = {}
+    for local, exported in pairs:
+        if not local.isidentifier() or not exported.isidentifier():
+            continue
+        # A name published twice under one spelling has no single answer,
+        # and guessing costs a wrong edge where refusing costs none.
+        aliases[exported] = local if aliases.get(exported, local) == local else ""
     return {exported: local for exported, local in aliases.items() if local}
 
 
@@ -502,21 +524,129 @@ def refine_csharp_visibility(def_node: Node, current_visibility: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Java node-aware visibility refinement
+# ---------------------------------------------------------------------------
+
+_JAVA_ACCESS_KEYWORDS = ("private", "protected", "public")
+
+# Members of these bodies are implicitly public (JLS 9.4, 9.5, 9.6).
+_JAVA_PUBLIC_BODIES = frozenset({"interface_body", "annotation_type_body"})
+
+
+def refine_java_visibility(def_node: Node) -> str:
+    """Give a Java declaration the access it writes, else its scope's default.
+
+    Read from the AST because the query's modifier-less pattern matches first
+    and the parser keeps the first match, so ``private class X`` reaches
+    ``java_visibility`` with no modifier text at all. With no access keyword a
+    declaration is package-private, except that interface and annotation
+    members are public and an enum constructor is private.
+    """
+    modifiers = next((c for c in def_node.children if c.type == "modifiers"), None)
+    if modifiers is not None:
+        written = {c.type for c in modifiers.children}
+        for keyword in _JAVA_ACCESS_KEYWORDS:
+            if keyword in written:
+                return keyword
+    body = def_node.parent
+    if body is None:
+        return "internal"
+    if body.type in _JAVA_PUBLIC_BODIES:
+        return "public"
+    if def_node.type == "constructor_declaration" and body.type == "enum_body_declarations":
+        return "private"
+    return "internal"
+
+
+# ---------------------------------------------------------------------------
 # Rust node-aware visibility refinement
 # ---------------------------------------------------------------------------
 
 
-def refine_rust_visibility(def_node: Node, current_visibility: str, src: str) -> str:
-    """Give a trait's items the visibility the trait itself declares.
+_RUST_TYPE_DECL_KINDS: frozenset[str] = frozenset(
+    {
+        "struct_item",
+        "enum_item",
+        "union_item",
+        "trait_item",
+        "type_item",
+    }
+)
 
-    Rust forbids a visibility modifier on a trait item, so ``rust_visibility``
-    reads empty modifier text and calls every method of a ``pub trait``
-    private. The trait's own modifier is the reachable answer: a ``pub trait``
-    is downstream-callable API, and a private trait's methods are not.
+
+def _rust_extract_type_name(node: Node | None, src: str) -> str | None:
+    """Extract the base type identifier from a Rust type AST node."""
+    if node is None:
+        return None
+    if node.type == "type_identifier":
+        return node_text(node, src).strip() or None
+    if node.type == "scoped_type_identifier":
+        name_node = node.child_by_field_name("name")
+        if name_node is not None:
+            return _rust_extract_type_name(name_node, src)
+    if node.type in ("generic_type", "reference_type"):
+        inner = node.child_by_field_name("type")
+        if inner is not None:
+            return _rust_extract_type_name(inner, src)
+    for child in node.children:
+        if child.type == "type_identifier":
+            return node_text(child, src).strip() or None
+        nested = _rust_extract_type_name(child, src)
+        if nested:
+            return nested
+    return None
+
+
+def refine_rust_visibility(def_node: Node, current_visibility: str, src: str) -> str:
+    """Give a trait's items or an impl block the visibility the target declares.
+
+    Rust forbids a visibility modifier on trait items and impl blocks, so
+    ``rust_visibility`` reads empty modifier text and calls them private by default.
+    - For trait items: the enclosing trait's own modifier provides the visibility.
+    - For impl blocks: the target type (or trait) declaration in the same scope provides
+      the visibility.
     """
     if any(c.type == "visibility_modifier" for c in def_node.children):
         return current_visibility
-    # Trait items sit directly in the trait's ``declaration_list``. Matching
+
+    # Case 1: An `impl_item` block inherits the visibility of its target type or trait.
+    if def_node.type == "impl_item":
+        parent = def_node.parent
+        if parent is None:
+            return current_visibility
+
+        target_names: list[str] = []
+        type_name = _rust_extract_type_name(def_node.child_by_field_name("type"), src)
+        if type_name:
+            target_names.append(type_name)
+        trait_name = _rust_extract_type_name(def_node.child_by_field_name("trait"), src)
+        if trait_name and trait_name not in target_names:
+            target_names.append(trait_name)
+
+        if not target_names:
+            return current_visibility
+
+        for target in target_names:
+            for sibling in parent.children:
+                if sibling.type in _RUST_TYPE_DECL_KINDS:
+                    name_child = sibling.child_by_field_name("name")
+                    if name_child is None:
+                        name_child = next(
+                            (c for c in sibling.children if c.type == "type_identifier"),
+                            None,
+                        )
+                    if name_child is not None and node_text(name_child, src).strip() == target:
+                        modifier = next(
+                            (c for c in sibling.children if c.type == "visibility_modifier"),
+                            None,
+                        )
+                        if modifier is not None:
+                            return rust_visibility("", [node_text(modifier, src)])
+                        return "private"
+
+        return current_visibility
+
+    # Case 2: Trait items sit directly in the trait's ``declaration_list``. Matching
     # that exact shape rather than walking ancestors keeps an item nested
     # inside a defaulted method's body out of the trait's bucket.
     decls = def_node.parent
@@ -618,6 +748,16 @@ def _has_export_marker(def_node: Node, src: str) -> bool:
     return False
 
 
+def _in_anonymous_namespace(def_node: Node) -> bool:
+    """Return True if an unnamed ``namespace { ... }`` encloses the def."""
+    ancestor = def_node.parent
+    while ancestor is not None:
+        if ancestor.type == "namespace_definition" and ancestor.child_by_field_name("name") is None:
+            return True
+        ancestor = ancestor.parent
+    return False
+
+
 def _has_file_scope_static(def_node: Node, src: str) -> bool:
     """Return True if a ``static`` storage-class specifier appears in the leading declarators."""
     for child in def_node.children[:4]:
@@ -643,7 +783,8 @@ def refine_cpp_visibility(def_node: Node, current_visibility: str, src: str) -> 
         ``private`` (the C++ class default) — ``struct`` defaults to
         ``public``.
       * Free function at namespace / file scope with ``static`` storage
-        class → ``private`` (translation-unit local; not importable).
+        class, or anything in an anonymous namespace → ``private``
+        (translation-unit local; not importable).
       * ``__declspec(dllexport)`` or ``__attribute__((visibility("default")))``
         → forces ``public`` and sets ``is_exported = True`` so a future
         "exported entry point" check can whitelist it.
@@ -662,8 +803,9 @@ def refine_cpp_visibility(def_node: Node, current_visibility: str, src: str) -> 
         # No access specifier — use the enclosing aggregate's default.
         return _enclosing_class_default_access(def_node), False
 
-    # 3. File-scope ``static`` is translation-unit local.
-    if _has_file_scope_static(def_node, src):
+    # 3. File-scope ``static`` and an anonymous namespace are both internal
+    # linkage: translation-unit local.
+    if _has_file_scope_static(def_node, src) or _in_anonymous_namespace(def_node):
         return "private", False
 
     return current_visibility, False

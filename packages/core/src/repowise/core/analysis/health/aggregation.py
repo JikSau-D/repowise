@@ -13,33 +13,43 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
-from .models import Severity
+from .models import Severity, primary_finding
 from .ranking import worst_metric
-from .rows import detail_map, field
+from .rows import detail_map, field, scored_rows
 from .scoring import (
     CATEGORY_CAPS,
+    HISTORY_CATEGORY,
     SCORE_FLOOR,
     SCORE_MAX,
     biomarker_category,
     biomarker_weight,
+    deduction_split,
+    history_cap,
     is_advisory,
     severity_deduction,
 )
 
 __all__ = [
     "MODULE_ROOT_LABEL",
+    "NLOC_NULL_REASON",
     "SEVERITY_ORDER",
     "biomarker_breakdown",
     "finding_base_deduction",
     "finding_raw_deduction",
     "module_label",
+    "module_labels",
     "module_rollups",
+    "primary_and_magnitude",
+    "primary_and_magnitude_by_file",
     "score_breakdown",
     "severity_breakdown",
 ]
 
 #: Label for a file that sits directly in the repository root.
 MODULE_ROOT_LABEL = "root"
+
+#: Why a file has no NLOC, for surfaces that show the gap as null.
+NLOC_NULL_REASON = "not measured: health analysis counts NLOC only in files it parses as code"
 
 #: The buckets a severity breakdown always declares, worst first. Fixed rather
 #: than derived from the data so an absent severity reads as 0, not as missing.
@@ -59,6 +69,15 @@ def module_label(file_path: str | None) -> str:
     """
     head, separator, _ = (file_path or "").partition("/")
     return head if separator else MODULE_ROOT_LABEL
+
+
+def module_labels(file_paths: Iterable[str | None]) -> set[str]:
+    """The modules *file_paths* span: the one axis every module count uses.
+
+    Module health buckets on :func:`module_label`, so a count taken any other way
+    (package boundaries, top two segments) names a number no module list shows.
+    """
+    return {module_label(path) for path in file_paths if path}
 
 
 def _nloc(row: Any) -> int:
@@ -109,7 +128,9 @@ def module_rollups(
     files are all held at the floor resolves on the path instead of on depth.
     """
     buckets: dict[str, list[Any]] = {}
-    for row in metrics:
+    # A file health has no dialect for carries no score and so no weight in
+    # its module's average; a module of nothing else is not a row.
+    for row in scored_rows(metrics):
         module = field(row, "module", None)
         if module:
             buckets.setdefault(str(module), []).append(row)
@@ -205,6 +226,31 @@ def finding_raw_deduction(finding: Any) -> float:
     )
 
 
+def primary_and_magnitude(findings: Sequence[Any]) -> dict[str, Any]:
+    """Dominant cause + pre-clamp deduction magnitude for one file's findings.
+
+    ``total_deduction`` sums stored ``health_impact``, the applied (capped)
+    value; :func:`finding_raw_deduction` is unscaled and differs on capped files.
+    """
+    if not findings:
+        return {"primary_biomarker": None, "primary_reason": None, "total_deduction": None}
+    primary = primary_finding(findings)
+    total = sum(float(field(x, "health_impact", 0.0) or 0.0) for x in findings)
+    return {
+        "primary_biomarker": field(primary, "biomarker_type") if primary else None,
+        "primary_reason": field(primary, "reason") if primary else None,
+        "total_deduction": round(total, 3),
+    }
+
+
+def primary_and_magnitude_by_file(findings: Iterable[Any]) -> dict[str, dict[str, Any]]:
+    """:func:`primary_and_magnitude` for each ``file_path`` in *findings*."""
+    by_file: dict[str, list[Any]] = {}
+    for f in findings:
+        by_file.setdefault(field(f, "file_path"), []).append(f)
+    return {path: primary_and_magnitude(fs) for path, fs in by_file.items()}
+
+
 def score_breakdown(findings: Sequence[Any]) -> dict[str, Any]:
     """Reconstruct one file's per-category deductions from its open findings.
 
@@ -228,10 +274,13 @@ def score_breakdown(findings: Sequence[Any]) -> dict[str, Any]:
 
     categories: list[dict[str, Any]] = []
     total_deduction = 0.0
-    for category, cap in CATEGORY_CAPS.items():
+    # The history cap follows the structure half, so report the one it scored under.
+    structure, _ = deduction_split(findings)
+    for category, static_cap in CATEGORY_CAPS.items():
         entries = per_category.get(category, [])
         if not entries:
             continue
+        cap = history_cap(structure) if category == HISTORY_CATEGORY else static_cap
         raw_each = [finding_raw_deduction(f) for f in entries]
         applied_each = [float(field(f, "health_impact", 0.0) or 0.0) for f in entries]
         raw_sum = sum(raw_each)

@@ -865,7 +865,7 @@ The `GitIndexer` runs once during `repowise init` (after graph construction, bef
 generation) and incrementally during `repowise update`. All git features degrade
 gracefully when git metadata is unavailable; they simply skip git-enriched context.
 
-### 7.1 GitIndexer (`packages/core/ingestion/git_indexer.py`)
+### 7.1 GitIndexer (`packages/core/src/repowise/core/ingestion/git_indexer/`)
 
 The `GitIndexer` class mines git history into the `git_metadata` SQL table. For each
 tracked file, it computes:
@@ -996,6 +996,10 @@ repowise dead-code resolve [FINDING_ID]
   --note "reason"
 ```
 
+With an index at HEAD, the command reads the findings `init`/`update` stored,
+the same rows `get_dead_code` serves. A floor below the stored one (0.4), an
+index behind HEAD, or no index at all runs the analyzer over the working tree.
+
 ### 8.4 Integration with Other Components
 
 Dead code findings are stored in the `dead_code_findings` SQL table with a status
@@ -1060,7 +1064,7 @@ repowise decision health     # health summary
 | `core/analysis/decision_extractor.py` | All 4 capture sources + staleness computation |
 | `core/persistence/models.py` | `DecisionRecord` ORM model |
 | `core/persistence/crud.py` | 8 decision CRUD functions |
-| `server/mcp_server/tool_why.py` | MCP tool `get_why` (3-mode: search, path, health dashboard) |
+| `server/mcp_server/tool_why/` | MCP tool `get_why` (package: one module per mode, plus shared loading, ranking, projection and caps) |
 | `server/routers/decisions.py` | REST API endpoints |
 | `cli/commands/decision_cmd.py` | CLI command group (7 subcommands) |
 
@@ -1462,7 +1466,7 @@ in the existing `wiki_pages` table, queries are plain SQL with `<=>` cosine dist
 and backup/restore is a single `pg_dump`. The HNSW index (`CREATE INDEX ... USING hnsw`)
 gives query latency on par with LanceDB at typical repowise dataset sizes.
 
-The `VectorStore` abstraction in `packages/core/src/repowise/core/persistence/vector.py`
+The `VectorStore` abstraction in `packages/core/src/repowise/core/persistence/vector_store/`
 selects the backend at startup based on `DATABASE_URL`: SQLite → LanceDB, PostgreSQL → pgvector.
 
 ### NetworkX + SQLite fallback, not Neo4j
